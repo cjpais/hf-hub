@@ -1,7 +1,6 @@
 use super::Progress as SyncProgress;
 use super::{RepoInfo, HF_ENDPOINT};
 use crate::{Cache, Repo, RepoType};
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use indicatif::ProgressBar;
 use rand::Rng;
@@ -22,7 +21,8 @@ use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::{AcquireError, Semaphore, TryAcquireError};
-use tokio::task::JoinError;
+use tokio::task::{JoinError, JoinSet};
+pub use tokio_util::sync::CancellationToken;
 
 /// Current version (used in user-agent)
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -201,6 +201,12 @@ pub enum ApiError {
     /// Someone else is writing/downloading said file
     #[error("Lock acquisition failed: {0}")]
     LockAcquisition(PathBuf),
+
+    /// The download was cancelled via its [`CancellationToken`]. The partially
+    /// downloaded `.sync.part` tempfile is left in place so a subsequent call
+    /// resumes from where it stopped rather than starting over.
+    #[error("Download cancelled")]
+    Cancelled,
 }
 
 /// Helper to create [`Api`] with all the options.
@@ -647,6 +653,7 @@ impl ApiRepo {
         length: usize,
         filename: PathBuf,
         mut progressbar: P,
+        cancel: &CancellationToken,
     ) -> Result<PathBuf, ApiError> {
         let semaphore = Arc::new(Semaphore::new(self.api.max_files));
         let parallel_failures_semaphore = Arc::new(Semaphore::new(self.api.parallel_failures));
@@ -685,9 +692,18 @@ impl ApiRepo {
         };
         progressbar.update(start).await;
 
+        // Bail out before spawning anything if cancellation already fired; the
+        // tempfile (with its committed-offset marker) stays on disk for resume.
+        if cancel.is_cancelled() {
+            return Err(ApiError::Cancelled);
+        }
+
         let chunk_size = self.api.chunk_size.unwrap_or(length);
-        let n_chunks = length / chunk_size;
-        let mut handles = Vec::with_capacity(n_chunks);
+        // A `JoinSet` (rather than detached `tokio::spawn` handles collected into a
+        // `FuturesUnordered`) is what makes cancellation real: dropping/shutting it
+        // down aborts every chunk task. Detached handles would keep downloading in
+        // the background even after the caller stopped awaiting.
+        let mut join_set: JoinSet<Result<(usize, usize), ApiError>> = JoinSet::new();
         for start in (start..length).step_by(chunk_size) {
             let url = url.to_string();
             let filename = filename.clone();
@@ -699,7 +715,7 @@ impl ApiRepo {
             let max_retries = self.api.max_retries;
             let parallel_failures_semaphore = parallel_failures_semaphore.clone();
             let progress = progressbar.clone();
-            handles.push(tokio::spawn(async move {
+            join_set.spawn(async move {
                 let permit = permit.acquire_owned().await?;
                 let mut chunk =
                     Self::download_chunk(&client, &url, &filename, start, stop, progress.clone())
@@ -732,14 +748,29 @@ impl ApiRepo {
                 }
                 drop(permit);
                 chunk
-            }));
+            });
         }
 
-        let mut futures: FuturesUnordered<_> = handles.into_iter().collect();
         let mut temporaries = BinaryHeap::new();
         let mut committed: u64 = start as u64;
-        while let Some(chunk) = futures.next().await {
-            let chunk = chunk?;
+        loop {
+            let joined = tokio::select! {
+                // `biased` so cancellation is always observed in preference to a
+                // ready chunk result: the moment the token fires we abort all
+                // in-flight chunk tasks (`shutdown` aborts and awaits them) and
+                // return, leaving the `.sync.part` tempfile and its committed-offset
+                // marker on disk so a later call resumes instead of restarting.
+                biased;
+                _ = cancel.cancelled() => {
+                    join_set.shutdown().await;
+                    return Err(ApiError::Cancelled);
+                }
+                joined = join_set.join_next() => match joined {
+                    Some(joined) => joined,
+                    None => break,
+                },
+            };
+            let chunk = joined?;
             let (start, stop) = chunk?;
             temporaries.push(Reverse((start, stop)));
 
@@ -885,8 +916,57 @@ impl ApiRepo {
     pub async fn download_with_progress<P: Progress + Clone + Send + Sync + 'static>(
         &self,
         filename: &str,
-        mut progress: P,
+        progress: P,
     ) -> Result<PathBuf, ApiError> {
+        // A token that is never triggered — behaviourally identical to the
+        // original non-cancellable download.
+        self.download_with_progress_cancellable(filename, progress, CancellationToken::new())
+            .await
+    }
+
+    /// Same as [`ApiRepo::download`], but cancellable through the supplied
+    /// [`CancellationToken`]. Cancelling returns [`ApiError::Cancelled`] and
+    /// leaves the partially downloaded `.sync.part` tempfile in the cache, so a
+    /// later call resumes from where it stopped instead of restarting.
+    /// ```no_run
+    /// use hf_hub::api::tokio::{Api, CancellationToken};
+    /// # tokio_test::block_on(async {
+    /// let api = Api::new().unwrap();
+    /// let cancel = CancellationToken::new();
+    /// // e.g. trigger `cancel.cancel()` from elsewhere to stop the download.
+    /// let local_filename = api
+    ///     .model("gpt2".to_string())
+    ///     .download_cancellable("model.safetensors", cancel)
+    ///     .await
+    ///     .unwrap();
+    /// # })
+    /// ```
+    pub async fn download_cancellable(
+        &self,
+        filename: &str,
+        cancel: CancellationToken,
+    ) -> Result<PathBuf, ApiError> {
+        if self.api.progress {
+            self.download_with_progress_cancellable(filename, ProgressBar::new(0), cancel)
+                .await
+        } else {
+            self.download_with_progress_cancellable(filename, (), cancel)
+                .await
+        }
+    }
+
+    /// Same as [`ApiRepo::download_with_progress`], but cancellable through the
+    /// supplied [`CancellationToken`]. See [`ApiRepo::download_cancellable`] for
+    /// the cancellation and resume semantics.
+    pub async fn download_with_progress_cancellable<P: Progress + Clone + Send + Sync + 'static>(
+        &self,
+        filename: &str,
+        mut progress: P,
+        cancel: CancellationToken,
+    ) -> Result<PathBuf, ApiError> {
+        if cancel.is_cancelled() {
+            return Err(ApiError::Cancelled);
+        }
         let url = self.url(filename);
         let metadata = self.api.metadata(&url).await?;
         let cache = self.api.cache.repo(self.repo.clone());
@@ -899,7 +979,7 @@ impl ApiRepo {
         let mut tmp_path = blob_path.clone();
         tmp_path.set_extension(EXTENSION);
         let tmp_filename = self
-            .download_tempfile(&url, metadata.size, tmp_path, progress)
+            .download_tempfile(&url, metadata.size, tmp_path, progress, &cancel)
             .await?;
 
         tokio::fs::rename(&tmp_filename, &blob_path).await?;
@@ -1488,5 +1568,178 @@ mod tests {
             let repo = api.model("meta-llama/Meta-Llama-3.1-8B".to_string());
             repo.download("config.json").await.unwrap();
         }
+    }
+
+    /// An already-cancelled token must short-circuit before any network work and
+    /// leave the cache untouched. The endpoint points at a dead port so that a
+    /// regression (contacting the network instead of bailing) surfaces as a
+    /// request error rather than silently passing.
+    #[tokio::test]
+    async fn cancel_before_download_returns_cancelled() {
+        let tmp = TempDir::new();
+        let api = ApiBuilder::new()
+            .with_progress(false)
+            .with_endpoint("http://127.0.0.1:1".to_string())
+            .with_cache_dir(tmp.path.clone())
+            .build()
+            .unwrap();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = api
+            .model("julien-c/dummy-unknown".to_string())
+            .download_cancellable("config.json", cancel)
+            .await;
+        assert!(matches!(result, Err(ApiError::Cancelled)), "got {result:?}");
+        // Nothing should have been written into the cache directory.
+        assert!(std::fs::read_dir(&tmp.path).unwrap().next().is_none());
+    }
+
+    /// Cancelling mid-download must (1) return [`ApiError::Cancelled`], (2) leave
+    /// the `.sync.part` tempfile in the cache, and (3) let a subsequent call
+    /// resume/complete into the correct bytes. Driven by a local HTTP server so
+    /// the timing is controllable and no network is required.
+    #[tokio::test]
+    async fn cancel_midway_leaves_resumable_partial_then_completes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        // Deterministic content: global byte `i` has value `i as u8`.
+        const TOTAL: usize = 512 * 1024;
+
+        fn find_sync_part(dir: &Path) -> Option<PathBuf> {
+            for entry in std::fs::read_dir(dir).ok()?.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if let Some(found) = find_sync_part(&path) {
+                        return Some(found);
+                    }
+                } else if path.to_string_lossy().ends_with(".sync.part") {
+                    return Some(path);
+                }
+            }
+            None
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Per-8KiB-slice delay: high enough that the first download is still in
+        // flight when we cancel, then dropped to 0 so the resume completes fast.
+        let delay_ms = Arc::new(AtomicU64::new(60));
+        let server_delay = delay_ms.clone();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let server_delay = server_delay.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    // Read request headers up to the blank line.
+                    let mut req = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => req.push(byte[0]),
+                        }
+                    }
+                    let req_str = String::from_utf8_lossy(&req);
+                    let range = req_str.lines().find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("range: bytes=")
+                            .map(str::to_string)
+                    });
+                    let Some(range) = range else { return };
+                    let mut parts = range.trim().splitn(2, '-');
+                    let start: usize = parts.next().unwrap().parse().unwrap();
+                    let stop: usize = parts.next().unwrap().parse().unwrap();
+
+                    // Metadata probe (`bytes=0-0`): return etag/commit/size headers.
+                    if start == 0 && stop == 0 {
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\netag: \"testetag\"\r\n\
+                             x-repo-commit: testcommit\r\ncontent-range: bytes 0-0/{TOTAL}\r\n\
+                             content-length: 1\r\nconnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&[0u8]);
+                        return;
+                    }
+
+                    // Chunk request: stream [start, stop] slowly, one slice at a time.
+                    let len = stop - start + 1;
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {start}-{stop}/{TOTAL}\r\n\
+                         content-length: {len}\r\nconnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    let mut sent = 0usize;
+                    while sent < len {
+                        let piece = std::cmp::min(8192, len - sent);
+                        let buf: Vec<u8> = (start + sent..start + sent + piece)
+                            .map(|i| i as u8)
+                            .collect();
+                        if stream.write_all(&buf).is_err() {
+                            return;
+                        }
+                        let _ = stream.flush();
+                        sent += piece;
+                        let d = server_delay.load(Ordering::Relaxed);
+                        if d > 0 {
+                            std::thread::sleep(Duration::from_millis(d));
+                        }
+                    }
+                });
+            }
+        });
+
+        let tmp = TempDir::new();
+        let api = ApiBuilder::new()
+            .with_progress(false)
+            .with_endpoint(format!("http://{addr}"))
+            .with_cache_dir(tmp.path.clone())
+            .with_chunk_size(Some(128 * 1024))
+            .with_max_files(2)
+            .build()
+            .unwrap();
+
+        // Phase 1: start the download, then cancel while it is still in flight.
+        let cancel = CancellationToken::new();
+        let handle = {
+            let api = api.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                api.model("test/repo".to_string())
+                    .download_cancellable("model.bin", cancel)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        cancel.cancel();
+        let result = handle.await.unwrap();
+        assert!(matches!(result, Err(ApiError::Cancelled)), "got {result:?}");
+
+        // A resumable partial must remain behind.
+        assert!(
+            find_sync_part(&tmp.path).is_some(),
+            "expected a .sync.part tempfile to remain after cancellation"
+        );
+
+        // Phase 2: no delay, no cancellation → resume/complete into correct bytes.
+        delay_ms.store(0, Ordering::Relaxed);
+        let downloaded = api
+            .model("test/repo".to_string())
+            .download_cancellable("model.bin", CancellationToken::new())
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&downloaded).unwrap();
+        assert_eq!(bytes.len(), TOTAL);
+        let expected: Vec<u8> = (0..TOTAL).map(|i| i as u8).collect();
+        assert_eq!(bytes, expected, "resumed download produced wrong bytes");
     }
 }

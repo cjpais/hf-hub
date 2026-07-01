@@ -32,6 +32,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 thiserror = { version = "2", optional = true }
 tokio = { version = "1.29.1", optional = true, features = ["fs", "macros"] }
+tokio-util = { version = "0.7", optional = true, default-features = false }
 ureq = { version = "3", optional = true, features = ["json", "socks-proxy"] }
 native-tls = { version = "0.2.12", optional = true }
 
@@ -70,6 +71,7 @@ tokio = [
   "dep:thiserror",
   "dep:tokio",
   "tokio/rt-multi-thread",
+  "dep:tokio-util",
   "dep:libc",
   "dep:windows-sys",
 ]
