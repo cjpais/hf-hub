@@ -532,6 +532,7 @@ impl Api {
         let headers = response.headers();
         let header_commit = HeaderName::from_static("x-repo-commit");
         let header_linked_etag = HeaderName::from_static("x-linked-etag");
+        let header_linked_size = HeaderName::from_static("x-linked-size");
         let header_etag = HeaderName::from_static("etag");
 
         let etag = match headers.get(&header_linked_etag) {
@@ -548,28 +549,42 @@ impl Api {
             .to_str()?
             .to_string();
 
-        // The response was redirected to S3 most likely which will
-        // know about the size of the file
-        let response = if response.status().is_redirection() {
-            self.client
-                .get(headers.get(LOCATION).unwrap().to_str()?.to_string())
-                .header(RANGE, "bytes=0-0")
-                .send()
-                .await?
-        } else {
-            response
-        };
-        let headers = response.headers();
-        let content_range = headers
-            .get(CONTENT_RANGE)
-            .ok_or(ApiError::MissingHeader(CONTENT_RANGE))?
-            .to_str()?;
+        // Hugging Face includes the authoritative size on its resolve response.
+        // Prefer it so Xet/S3 redirects do not need to preserve Content-Range.
+        let linked_size = headers
+            .get(&header_linked_size)
+            .map(|size| size.to_str())
+            .transpose()?
+            .map(str::parse)
+            .transpose()?;
 
-        let size = content_range
-            .split('/')
-            .next_back()
-            .ok_or(ApiError::InvalidHeader(CONTENT_RANGE))?
-            .parse()?;
+        let size = if let Some(size) = linked_size {
+            size
+        } else {
+            // Older Hub responses may only expose size after redirecting to the
+            // storage backend, which reports it through Content-Range.
+            let response = if response.status().is_redirection() {
+                self.client
+                    .get(headers.get(LOCATION).unwrap().to_str()?.to_string())
+                    .header(RANGE, "bytes=0-0")
+                    .send()
+                    .await?
+            } else {
+                response
+            };
+            let response = response.error_for_status()?;
+            let headers = response.headers();
+            let content_range = headers
+                .get(CONTENT_RANGE)
+                .ok_or(ApiError::MissingHeader(CONTENT_RANGE))?
+                .to_str()?;
+
+            content_range
+                .split('/')
+                .next_back()
+                .ok_or(ApiError::InvalidHeader(CONTENT_RANGE))?
+                .parse()?
+        };
         Ok(Metadata {
             commit_hash,
             etag,
@@ -1568,6 +1583,46 @@ mod tests {
             let repo = api.model("meta-llama/Meta-Llama-3.1-8B".to_string());
             repo.download("config.json").await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_uses_linked_size_without_following_redirect() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => request.push(byte[0]),
+                }
+            }
+
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "x-linked-etag: linked-etag\r\n",
+                "x-linked-size: 731357568\r\n",
+                "x-repo-commit: test-commit\r\n",
+                "location: http://127.0.0.1:1/signed-download\r\n",
+                "content-length: 0\r\n",
+                "connection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let api = ApiBuilder::new().build().unwrap();
+        let metadata = api
+            .metadata(&format!("http://{addr}/resolve/main/model.gguf"))
+            .await
+            .unwrap();
+
+        assert_eq!(metadata.size, 731357568);
     }
 
     /// An already-cancelled token must short-circuit before any network work and
