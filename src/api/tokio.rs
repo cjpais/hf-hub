@@ -10,7 +10,7 @@ use reqwest::{
         CONTENT_RANGE, LOCATION, RANGE, USER_AGENT,
     },
     redirect::Policy,
-    Client, Error as ReqwestError, RequestBuilder,
+    Client, Error as ReqwestError, RequestBuilder, StatusCode,
 };
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -207,6 +207,22 @@ pub enum ApiError {
     /// resumes from where it stopped rather than starting over.
     #[error("Download cancelled")]
     Cancelled,
+
+    /// The server (or a proxy in front of it) did not honor a `Range` request:
+    /// it answered with something other than `206 Partial Content`, or sent
+    /// more bytes than were requested. Chunked downloads fall back to a single
+    /// sequential stream when this happens.
+    #[error("Server ignored Range request (status {0})")]
+    RangeNotSupported(StatusCode),
+
+    /// The server sent a different number of bytes than the file size.
+    #[error("Expected {expected} bytes, received {received}")]
+    SizeMismatch {
+        /// File size from the metadata.
+        expected: usize,
+        /// Bytes received (stops counting at the first byte past `expected`).
+        received: usize,
+    },
 }
 
 /// Helper to create [`Api`] with all the options.
@@ -667,6 +683,7 @@ impl ApiRepo {
         url: &str,
         length: usize,
         filename: PathBuf,
+        name: &str,
         mut progressbar: P,
         cancel: &CancellationToken,
     ) -> Result<PathBuf, ApiError> {
@@ -738,6 +755,11 @@ impl ApiRepo {
                 let mut i = 0;
                 if parallel_failures > 0 {
                     while let Err(dlerr) = chunk {
+                        // Retrying won't make the server honor Range; surface it
+                        // right away so the caller can fall back to one stream.
+                        if matches!(dlerr, ApiError::RangeNotSupported(_)) {
+                            return Err(dlerr);
+                        }
                         let parallel_failure_permit =
                             parallel_failures_semaphore.clone().try_acquire_owned()?;
 
@@ -786,7 +808,22 @@ impl ApiRepo {
                 },
             };
             let chunk = joined?;
-            let (start, stop) = chunk?;
+            let (start, stop) = match chunk {
+                Ok(range) => range,
+                Err(ApiError::RangeNotSupported(status)) => {
+                    // Something on the path strips `Range` (seen with corporate
+                    // proxies): every chunk would receive the whole file. Stop
+                    // the chunked transfer and stream the file once instead.
+                    log::warn!(
+                        "Range request answered with {status}; falling back to a single sequential download"
+                    );
+                    join_set.shutdown().await;
+                    return self
+                        .download_sequential(url, length, filename, name, progressbar, cancel)
+                        .await;
+                }
+                Err(err) => return Err(err),
+            };
             temporaries.push(Reverse((start, stop)));
 
             let mut modified = false;
@@ -825,6 +862,62 @@ impl ApiRepo {
         Ok(filename)
     }
 
+    /// Downloads the whole file in one plain GET, streaming it to `filename`
+    /// from offset 0. Used when the server ignores `Range`, so the chunked
+    /// path can't work. Progress restarts from zero via `init`.
+    async fn download_sequential<P: Progress>(
+        &self,
+        url: &str,
+        length: usize,
+        filename: PathBuf,
+        name: &str,
+        mut progressbar: P,
+        cancel: &CancellationToken,
+    ) -> Result<PathBuf, ApiError> {
+        progressbar.init(length, name).await;
+        progressbar.update(0).await;
+
+        let response = self.api.client.get(url).send().await?.error_for_status()?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&filename)
+            .await?;
+        file.seek(SeekFrom::Start(0)).await?;
+        let mut byte_stream = response.bytes_stream();
+        let mut written = 0usize;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ApiError::Cancelled),
+                next = byte_stream.next() => match next {
+                    Some(next) => next?,
+                    None => break,
+                },
+            };
+            if written + next.len() > length {
+                return Err(ApiError::SizeMismatch {
+                    expected: length,
+                    received: written + next.len(),
+                });
+            }
+            file.write_all(&next).await?;
+            written += next.len();
+            progressbar.update(next.len()).await;
+        }
+        if written != length {
+            return Err(ApiError::SizeMismatch {
+                expected: length,
+                received: written,
+            });
+        }
+        // Drops the trailing committed-offset marker.
+        file.set_len(length as u64).await?;
+        file.flush().await?;
+
+        progressbar.finish().await;
+        Ok(filename)
+    }
+
     async fn download_chunk<P>(
         client: &reqwest::Client,
         url: &str,
@@ -844,10 +937,22 @@ impl ApiRepo {
             .send()
             .await?
             .error_for_status()?;
+        // A `200` means the Range header was ignored and the body is the whole
+        // file. Accepting it would write the full file at `start` for every
+        // chunk and never finish, so reject it before reading the body.
+        let status = response.status();
+        if status != StatusCode::PARTIAL_CONTENT {
+            return Err(ApiError::RangeNotSupported(status));
+        }
+        // Never read past the requested range, whatever the server sends.
+        let max_len = stop - start + 1;
         let mut byte_stream = response.bytes_stream();
-        let mut buf: Vec<u8> = Vec::with_capacity(stop - start);
+        let mut buf: Vec<u8> = Vec::with_capacity(max_len);
         while let Some(next) = byte_stream.next().await {
             let next = next?;
+            if buf.len() + next.len() > max_len {
+                return Err(ApiError::RangeNotSupported(status));
+            }
             buf.extend(&next);
             progress.update(next.len()).await;
         }
@@ -994,7 +1099,7 @@ impl ApiRepo {
         let mut tmp_path = blob_path.clone();
         tmp_path.set_extension(EXTENSION);
         let tmp_filename = self
-            .download_tempfile(&url, metadata.size, tmp_path, progress, &cancel)
+            .download_tempfile(&url, metadata.size, tmp_path, filename, progress, &cancel)
             .await?;
 
         tokio::fs::rename(&tmp_filename, &blob_path).await?;
@@ -1796,5 +1901,86 @@ mod tests {
         assert_eq!(bytes.len(), TOTAL);
         let expected: Vec<u8> = (0..TOTAL).map(|i| i as u8).collect();
         assert_eq!(bytes, expected, "resumed download produced wrong bytes");
+    }
+
+    /// A proxy that strips `Range` makes every chunk request return the whole
+    /// file with `200 OK`. The download must not accept those bodies as chunks
+    /// (which overran the file and never finished); it falls back to one
+    /// sequential stream, reports exactly the file size and writes the right bytes.
+    #[tokio::test]
+    async fn range_ignored_falls_back_to_sequential_download() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Mutex;
+
+        const TOTAL: usize = 300 * 1024;
+
+        #[derive(Clone, Default)]
+        struct Counter(Arc<Mutex<(usize, usize)>>);
+        impl Progress for Counter {
+            async fn init(&mut self, size: usize, _filename: &str) {
+                *self.0.lock().unwrap() = (size, 0);
+            }
+            async fn update(&mut self, size: usize) {
+                self.0.lock().unwrap().1 += size;
+            }
+            async fn finish(&mut self) {}
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut req = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut byte) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => req.push(byte[0]),
+                        }
+                    }
+                    // Ignore any Range header: always the full file.
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\netag: \"testetag\"\r\n\
+                         x-repo-commit: testcommit\r\nx-linked-size: {TOTAL}\r\n\
+                         content-length: {TOTAL}\r\nconnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    let body: Vec<u8> = (0..TOTAL).map(|i| i as u8).collect();
+                    let _ = stream.write_all(&body);
+                });
+            }
+        });
+
+        let tmp = TempDir::new();
+        let api = ApiBuilder::new()
+            .with_progress(false)
+            .with_endpoint(format!("http://{addr}"))
+            .with_cache_dir(tmp.path.clone())
+            .with_chunk_size(Some(64 * 1024))
+            .with_max_files(4)
+            .build()
+            .unwrap();
+
+        let progress = Counter::default();
+        let downloaded = api
+            .model("test/repo".to_string())
+            .download_with_progress_cancellable(
+                "model.bin",
+                progress.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let bytes = std::fs::read(&downloaded).unwrap();
+        let expected: Vec<u8> = (0..TOTAL).map(|i| i as u8).collect();
+        assert_eq!(bytes.len(), TOTAL);
+        assert_eq!(bytes, expected, "fallback download produced wrong bytes");
+        assert_eq!(*progress.0.lock().unwrap(), (TOTAL, TOTAL));
     }
 }
