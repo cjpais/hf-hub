@@ -877,7 +877,12 @@ impl ApiRepo {
         progressbar.init(length, name).await;
         progressbar.update(0).await;
 
-        let response = self.api.client.get(url).send().await?.error_for_status()?;
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ApiError::Cancelled),
+            response = self.api.client.get(url).send() => response?,
+        }
+        .error_for_status()?;
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .open(&filename)
@@ -1983,4 +1988,141 @@ mod tests {
         assert_eq!(bytes, expected, "fallback download produced wrong bytes");
         assert_eq!(*progress.0.lock().unwrap(), (TOTAL, TOTAL));
     }
+
+    #[tokio::test]
+    async fn cancel_while_sequential_fallback_waits_for_headers_preserves_retry() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::{watch, Notify};
+        use tokio::task::JoinSet;
+
+        const TOTAL: usize = 16 * 1024;
+        const CHUNK: usize = 4 * 1024;
+        let expected: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let tmp = TempDir::new();
+        let blob = tmp.path.join("models--local--repo/blobs/header-cancel");
+        let partial = blob.with_extension("sync.part");
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        let mut original_partial = vec![0; TOTAL + size_of::<u64>()];
+        original_partial[..CHUNK].copy_from_slice(&expected[..CHUNK]);
+        original_partial[TOTAL..].copy_from_slice(&(CHUNK as u64).to_le_bytes());
+        std::fs::write(&partial, &original_partial).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let waiting_for_headers = Arc::new(Notify::new());
+        let ready = waiting_for_headers.clone();
+        let first_plain_get = Arc::new(AtomicBool::new(true));
+        let (release_headers, released) = watch::channel(false);
+        let payload = Arc::new(expected.clone());
+        let server = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut socket, _) = accepted.unwrap();
+                        let ready = ready.clone();
+                        let first = first_plain_get.clone();
+                        let payload = payload.clone();
+                        let mut released = released.clone();
+                        connections.spawn(async move {
+                            let mut request = Vec::new();
+                            while !request.ends_with(b"\r\n\r\n") {
+                                let mut byte = [0u8; 1];
+                                if socket.read(&mut byte).await.unwrap_or(0) != 1 {
+                                    return;
+                                }
+                                request.push(byte[0]);
+                            }
+                            let head = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                            let range = head.lines().find_map(|line| line.strip_prefix("range: bytes="));
+                            let metadata = range == Some("0-0");
+                            if range.is_none() && first.swap(false, Ordering::SeqCst) {
+                                ready.notify_one();
+                                while !*released.borrow() {
+                                    if released.changed().await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            // The metadata probe works, but chunk requests ignore Range.
+                            let (status, body) = if metadata {
+                                ("206 Partial Content", &payload[..1])
+                            } else {
+                                ("200 OK", &payload[..])
+                            };
+                            let range_header = if metadata {
+                                format!("Content-Range: bytes 0-0/{TOTAL}\r\n")
+                            } else {
+                                String::new()
+                            };
+                            let headers = format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\
+                                 ETag: \"header-cancel\"\r\nX-Repo-Commit: {}\r\n\
+                                 X-Linked-Size: {TOTAL}\r\n{range_header}\r\n",
+                                body.len(), "b".repeat(40)
+                            );
+                            if socket.write_all(headers.as_bytes()).await.is_ok() {
+                                let _ = socket.write_all(body).await;
+                            }
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+        struct AbortServer(tokio::task::JoinHandle<()>);
+        impl Drop for AbortServer {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = AbortServer(server);
+
+        let api = ApiBuilder::new()
+            .with_token(None)
+            .with_progress(false)
+            .with_endpoint(endpoint)
+            .with_cache_dir(tmp.path.clone())
+            .with_chunk_size(Some(CHUNK))
+            .with_max_files(2)
+            .build()
+            .unwrap();
+        let repo = api.model("local/repo".into());
+        let cancel = CancellationToken::new();
+        let download = repo.download_cancellable("model.bin", cancel.clone());
+        tokio::pin!(download);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                _ = waiting_for_headers.notified() => {},
+                result = &mut download => panic!("download ended before header wait: {result:?}"),
+            }
+        }).await.expect("the plain GET request headers must reach the server");
+
+        cancel.cancel();
+        let prompt = tokio::time::timeout(Duration::from_secs(1), &mut download).await;
+        let cancelled_before_headers = matches!(prompt, Ok(Err(ApiError::Cancelled)));
+        // Release even on failure so the original implementation can unwind.
+        let _ = release_headers.send(true);
+        if prompt.is_err() {
+            let _ = tokio::time::timeout(Duration::from_secs(3), &mut download).await;
+        }
+        assert!(cancelled_before_headers, "cancellation must not wait for response headers");
+        assert_eq!(std::fs::read(&partial).unwrap(), original_partial);
+        assert!(!blob.exists(), "cancel must not publish a completed cache blob");
+        assert!(!tmp.path.join("models--local--repo/refs/main").exists());
+
+        let retry_cancel = CancellationToken::new();
+        let downloaded = tokio::time::timeout(
+            Duration::from_secs(5),
+            repo.download_cancellable("model.bin", retry_cancel.clone()),
+        ).await.expect("cancel must release the cache lock for retry").unwrap();
+        assert_eq!(std::fs::read(downloaded).unwrap(), expected);
+        assert!(!partial.exists());
+        assert!(!retry_cancel.is_cancelled());
+        assert!(cancel.is_cancelled());
+    }
+
 }
